@@ -1,0 +1,561 @@
+---
+title: "Correlation between Stock price and World News"
+author: "Chulwoo Kim"
+output: pdf_document
+---
+
+Since US stock market is one of the biggest areas in the world, various factors affect US stock market such as foreign exchange rate, interest rate, influential people's speech, national news, world news, and other markets. Thus, we can have questions reasonably; How much does stock market relate to the daily news?, Is it possible that people predict stock market based on daily news?
+Of course, world news will not have the greatest impact on US stock market. However, experiments show us there are slight effects between them.
+
+
+```{r}
+require(xts)
+library(forecast)
+library(stringr)
+library(dplyr)
+library(tidytext)
+library(tidyr)
+library(reshape2)
+library(randomForest)
+library(e1071)
+library(ROCR)
+library(ggplot2)
+library(wordcloud)
+
+```
+
+
+1. Data Collection 
+```{r}
+stock_data = read.csv("Data/DowJonesIndustrialAverage.csv", header = TRUE)
+news_data = read.csv("Data/WorldNews.csv", header = TRUE)
+combined_data = read.csv("Data/Combined_News_DJIA.csv", header = TRUE)
+fx_data = read.csv("Data/EurUsd.csv", header = TRUE)
+
+news_df <- data.frame(news_data)
+news_df %>% mutate_if(is.factor, as.character) -> news_df
+
+#data cleansing
+for(l in 1:dim(news_df)[1]) {
+  if(startsWith(news_df[l,]$News, "b'") || startsWith(news_df[l,]$News, "b\"")){
+    news_df[l,]$News <- substr(news_df[l,]$News, 3, nchar(news_df[l,]$News)-1)
+  }
+  news_df[l,]$News <- gsub('\\\\r\\\\n|\\\\n|\\\\t|\\\\', '', news_df[l,]$News)
+}
+news_df <- mutate(news_df, News = gsub("[[:punct:]]", " ", News))
+news_df <- mutate(news_df, News = gsub("[0-9]", "", News))
+```
+
+2. Exploratory Data Analysis
+
+Added two column; difference between close and open, and whether the each day is bull market
+```{r}
+# forex data
+fx_data[["diff"]] <- fx_data$Close - fx_data$Open
+fx_data[["isBull"]] <- ifelse(fx_data$diff >= 0, 1, 0)
+
+# stock data
+stock_data[["diff"]] <- stock_data$Close - stock_data$Open
+stock_data[["isBull"]] <- ifelse(stock_data$diff >= 0, 1, 0)
+
+```
+
+view the data by various plot
+(1) Analysis for stock price
+* Moving Averages plot
+```{r}
+# Moving Averages plot
+stock_data.ts <- xts(stock_data$Close, order.by=as.Date(stock_data$Date))
+
+par(mfrow=c(2,2))
+ylim <- c(min(stock_data.ts), max(stock_data.ts))
+plot(stock_data.ts, main="Raw time series")
+plot(ma(stock_data.ts, 20), main="Simple Moving Averages (k=20)", ylim=ylim)
+plot(ma(stock_data.ts, 60), main="Simple Moving Averages (k=60)", ylim=ylim)
+plot(ma(stock_data.ts, 120), main="Simple Moving Averages (k=120)", ylim=ylim)
+```
+
+* ETS
+```{r}
+# ETS
+temp_data <- stock_data.ts
+sd.train <- temp_data[1:1400,]
+sd.test <- temp_data[1401:nrow(temp_data),]
+
+fit.jj <- ets(sd.train)
+plot(forecast(fit.jj))
+```
+
+* Arima
+```{r}
+# Arima
+fit.ar <- arima(stock_data.ts, order=c(0,1,1))
+plot(forecast(fit.ar))
+```
+
+* Stock chart and Scale graph
+```{r}
+# Stock chart and Scale graph
+ggplot(stock_data, aes(Date,Close, group=1)) + geom_line()
+ggplot(stock_data, aes(Date,diff, colour=diff)) + geom_point() + scale_colour_gradientn(colours=rainbow(4))
+```
+
+(2) Analysis for world news, using stop words
+
+* word frequency plot (> 1500 freq)
+```{r}
+words_df <- news_df %>% unnest_tokens(word, News)
+data(stop_words)
+words_df <- words_df %>% anti_join(stop_words)
+wordscount <- count(words_df, word, sort = TRUE)
+
+wordscount %>% 
+  filter(n > 1500) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n)) +
+  geom_col() +
+  xlab(NULL) +
+  coord_flip()
+
+```
+
+* Zip's law of word frequency per year plot
+```{r}
+news_tf <- group_by(news_df, "Year" = substr(Date, 0,4))
+news_tf %>% mutate_if(is.factor, as.character) -> news_tf
+news_tf <- unnest_tokens(news_tf, word, News) %>% count(Year, word, sort=TRUE) %>% ungroup()
+news_tf <- left_join(news_tf, group_by(news_tf, Year) %>% summarize(total = sum(n)))
+
+freq_by_rank <- group_by(news_tf, Year) %>% mutate(rank=row_number(), 'term_frequency'= n/total)
+
+rank_subset <- freq_by_rank %>% filter(rank < 500, rank > 10)
+lm(log10(`term_frequency`) ~ log10(rank), data = rank_subset)
+
+# Fitting an exponent for Zip's law with world news
+ggplot(freq_by_rank, aes(rank, `term_frequency`, color = Year)) + 
+     geom_abline(intercept = -1.418, slope = -0.7853, color = "gray50", linetype = 2) +
+     geom_line(size = 1.2, alpha = 0.8) + 
+     scale_x_log10() +
+     scale_y_log10()
+
+```
+
+* Top 20 word based on tf-idf
+```{r}
+news_tf <- bind_tf_idf(news_tf, word, Year, n)
+#check tf_idf
+select(news_tf, -total) %>% arrange(desc(tf_idf))
+
+#top 20 words
+plot_news_tf <- news_tf %>%
+     arrange(desc(tf_idf)) %>%
+     mutate(word = factor(word, levels = rev(unique(word))))
+
+ggplot(top_n(plot_news_tf, 20), aes(word, tf_idf, fill = Year)) +
+     geom_col() +
+     labs(x = NULL, y = "tf-idf") +
+     coord_flip()
+```
+
+* Top 5 words by year
+```{r}
+#top 5 words by year
+plot_news_tf %>% 
+  group_by(Year) %>% 
+  top_n(5) %>% 
+  ungroup %>%
+  ggplot(aes(word, tf_idf, fill = Year)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~Year, ncol = 2, scales = "free") +
+  coord_flip()
+```
+
+* Word cloud
+```{r}
+words_df %>%
+  anti_join(stop_words) %>%
+  count(word) %>%
+  top_n(1000) %>%
+  with(wordcloud(word, n, max.words = 1000, scale = c(6,.1), colors = brewer.pal(6, 'Dark2')))
+
+wordscount %>%
+  top_n(1000) %>%
+  with(wordcloud(word, n, max.words = 1000, scale = c(6,.1), colors = brewer.pal(6, 'Dark2')))
+
+```
+
+
+3. Data preprocess, vectorizing
+```{r}
+temp.combined_data <- unnest_tokens(news_df, word, News)%>% count(Date, word, sort=TRUE) %>% ungroup()
+temp.combined_data <- left_join(stock_data[c("Date","isBull")], temp.combined_data, by=c("Date"="Date"))
+#combined_data <- combined_data[c('Date', 'word', 'n', 'isBull')]
+temp.combined_data <- filter(temp.combined_data, !is.na(word))
+#combined_data <- filter(combined_data, tf_idf > 0.01)
+temp.combined_data <- bind_tf_idf(temp.combined_data, word, Date, n)
+
+combined_data <- temp.combined_data
+
+# you should chenge arrange(desc(n)) or arrange(desc(tf_idf)), when you choose data, using overall top rank by word count or tf_idf
+combined_data <- group_by(temp.combined_data, Date) %>% arrange(desc(n)) %>% mutate(rank=row_number())
+
+#check minimum the number of rows by date
+min(table(combined_data$Date))
+
+combined_data <- group_by(combined_data, Date) %>% top_n(-20, rank)
+
+# spread data with tf_idf
+temp_data <- combined_data[c("Date", "word","tf_idf")]
+temp_data <- filter(temp_data, tf_idf > 0.03)
+spread_data.tf <- spread(temp_data, word, tf_idf, fill=0)
+spread_data.tf <- left_join(spread_data.tf, stock_data[c("Date","isBull")], by=c("Date"="Date"))
+spread_data.tf$isBull <- factor(spread_data.tf$isBull)
+
+# spread data with word count
+temp_data <- combined_data[c("Date", "word","n")]
+temp_data <- anti_join(temp_data, stop_words)
+#temp_data <- filter(temp_data, n > 3)
+spread_data.wd <- spread(temp_data, word, n, fill=0)
+spread_data.wd <- left_join(spread_data.wd, stock_data[c("Date","isBull")], by=c("Date"="Date"))
+spread_data.wd$isBull <- factor(spread_data.wd$isBull)
+
+#n-gram
+ngram_data <- news_df %>% unnest_tokens(bigram, News, token = "ngrams", n = 2) %>% count(Date, bigram, sort=TRUE) %>% ungroup()
+ngram_data <- left_join(stock_data[c("Date","isBull")], ngram_data, by=c("Date"="Date"))
+ngram_data <- bind_tf_idf(ngram_data, bigram, Date, n)
+
+#top 5 words by year
+temp <- group_by(news_df, "Year" = substr(Date, 0,4))
+ngram_data.plot <- temp %>% unnest_tokens(bigram, News, token = "ngrams", n = 2) %>% count(Year, bigram, sort=TRUE) %>% ungroup()
+
+plot_ngram_tf <- ngram_data.plot %>%
+  bind_tf_idf(bigram, Year, n) %>%
+  arrange(desc(tf_idf))
+
+plot_ngram_tf %>% 
+  group_by(Year) %>% 
+  top_n(5) %>% 
+  ungroup %>%
+  ggplot(aes(bigram, tf_idf, fill = Year)) +
+  geom_col(show.legend = FALSE) +
+  labs(x = NULL, y = "tf-idf") +
+  facet_wrap(~Year, ncol = 2, scales = "free") +
+  coord_flip()
+```
+
+```{r}
+# spread data with tf_idf and bigram
+temp_data <- ngram_data[c("Date", "bigram","tf_idf")]
+temp_data <- filter(temp_data, tf_idf > 0.035)
+spread_data.ngtf <- spread(temp_data, bigram, tf_idf, fill=0)
+spread_data.ngtf <- left_join(spread_data.ngtf, stock_data[c("Date","isBull")], by=c("Date"="Date"))
+spread_data.ngtf$isBull <- factor(spread_data.ngtf$isBull)
+colnames(spread_data.ngtf)[2:(length(spread_data.ngtf)-1)] <- paste0("word_", 1:(length(spread_data.ngtf)-2))
+
+# spread data with word count and bigram
+temp_data <- ngram_data[c("Date", "bigram","n")]
+temp_data <- filter(temp_data, n > 2)
+spread_data.ng <- spread(temp_data, bigram, n, fill=0)
+spread_data.ng <- left_join(spread_data.ng, stock_data[c("Date","isBull")], by=c("Date"="Date"))
+spread_data.ng$isBull <- factor(spread_data.ng$isBull)
+colnames(spread_data.ng)[2:(length(spread_data.ng)-1)] <- paste0("word_", 1:(length(spread_data.ng)-2))
+
+# spread data with word count and bigram, fx
+temp_data <- ngram_data[c("Date", "bigram","n")]
+temp_data <- filter(temp_data, n > 2)
+spread_data.ngfx <- spread(temp_data, bigram, n, fill=0)
+spread_data.ngfx <- left_join(spread_data.ngfx, fx_data[c("Date","isBull")], by=c("Date"="Date"))
+spread_data.ngfx$isBull <- factor(spread_data.ngfx$isBull)
+colnames(spread_data.ngfx)[2:(length(spread_data.ngfx)-1)] <- paste0("word_", 1:(length(spread_data.ngfx)-2))
+
+reshape_data <- dcast(combined_data, Date+isBull~rank, value.var = "word" )
+reshape_data$isBull <- factor(reshape_data$isBull)
+colnames(reshape_data)[3:length(reshape_data)] <- paste0("rank_", 1:(length(reshape_data)-2))
+
+wordcount_data  <- dcast(combined_data, Date+isBull~rank, value.var = "n" )
+wordcount_data$isBull <- factor(wordcount_data$isBull)
+colnames(wordcount_data)[3:length(wordcount_data)] <- paste0("rank_", 1:(length(wordcount_data)-2))
+
+final_data  <- dcast(combined_data, Date+isBull~rank, value.var = "tf_idf" )
+final_data$isBull <- factor(final_data$isBull)
+colnames(final_data)[3:length(final_data)] <- paste0("rank_", 1:(length(final_data)-2))
+
+# sentiment data with stock
+final_data.Bing <- subset(bing_and_nrc, method=="Bing et al.")
+final_data.Bing <- left_join(stock_data[c("Date","isBull")], final_data.Bing[c("Date","negative","positive")], by=c("Date"="Date"))
+final_data.Bing$isBull <- factor(final_data.Bing$isBull)
+final_data.Bing <- final_data.Bing[order(final_data.Bing$Date),]
+
+# word and forex data
+final_data.fx <- subset(final_data, select=-c(isBull))
+final_data.fx <- left_join(final_data.fx, fx_data[c("Date","isBull")], by=c("Date"="Date"))
+final_data.fx$isBull <- factor(final_data.fx$isBull)
+```
+
+
+```{r}
+wordscount['proportion'] <- wordscount$n/sum(wordscount$n)
+ggplot(wordscount, aes(proportion)) +
+   geom_histogram(show.legend = FALSE) +
+   xlim(NA, 0.0009)
+```
+
+```{r}
+#sentiment analysis
+sentiment_data <- combined_data[c("Date","isBull","word")]
+
+afinn <- sentiment_data %>% 
+  inner_join(get_sentiments("afinn")) %>% 
+  group_by(index = Date) %>% 
+  summarise(sentiment = sum(score)) %>% 
+  mutate(method = "AFINN")
+
+bing_and_nrc <- bind_rows(sentiment_data %>% 
+                            inner_join(get_sentiments("bing")) %>%
+                            mutate(method = "Bing et al."),
+                          sentiment_data %>% 
+                            inner_join(get_sentiments("nrc") %>% 
+                                         filter(sentiment %in% c("positive", 
+                                                                 "negative"))) %>%
+                            mutate(method = "NRC")) %>%
+  count(method, index = Date, sentiment) %>%
+  spread(sentiment, n, fill = 0) %>%
+  mutate(sentiment = positive - negative)
+
+bind_rows(afinn, 
+          bing_and_nrc) %>%
+ggplot(aes(index, sentiment, fill = method)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~method, ncol = 1, scales = "free_y")
+```
+
+
+
+4. Machine Learning
+
+```{r}
+set.seed(1234)
+#train <- sample(nrow(reshape_data), 0.7*nrow(reshape_data))
+#rd.train <- reshape_data[train,]
+#rd.validate <- reshape_data[-train,]
+
+# split data by random
+bound <- floor((nrow(final_data)/4)*3)         #define % of training and test set
+temp_data <- final_data[,-1]
+rd <- temp_data[sample(nrow(temp_data)), ]           #sample rows 
+rd.train <- rd[1:bound, ]              #get training set
+rd.test <- rd[(bound+1):nrow(rd), ]    #get test set
+
+
+bound <- floor((nrow(spread_data.tf)/4)*3)
+temp_data <- spread_data.tf[,-1]
+tf.train <- temp_data[1:bound, ]              #get training set
+tf.test <- temp_data[(bound+1):nrow(temp_data), ] 
+
+bound <- floor((nrow(spread_data.wd)/4)*3)
+temp_data <- spread_data.wd[,-1]
+wd.train <- temp_data[1:bound, ]              #get training set
+wd.test <- temp_data[(bound+1):nrow(temp_data), ] 
+
+# split data by date
+temp_data <- final_data[,-1]
+fd.train <- temp_data[1:1400,]
+fd.test <- temp_data[1401:nrow(temp_data),]
+
+temp_data <- final_data.Bing[,-1]
+std.train <- temp_data[1:1400,]
+std.test <- temp_data[1401:nrow(temp_data),]
+
+temp_data <- final_data.fx[,-1]
+fx.train <- temp_data[1:1400,]
+fx.test <- temp_data[1401:nrow(temp_data),]
+
+
+#logistic regression (time data)
+fit.logit <- glm(isBull~., data=fd.train, family=binomial())
+prob <- predict(fit.logit, fd.test, type="response")
+logit.pred <- factor(prob > .5, levels=c(FALSE, TRUE), labels=c("down", "up"))
+logit.perf <- table(fd.test$isBull, logit.pred,dnn=c("Actual", "Predicted"))
+
+## roc for logistic regression (time data)
+plot(performance(prediction(prob, fd.test$isBull), "tpr","fpr"))
+performance(prediction(prob, fd.test$isBull), "auc")
+
+#logistic regression (random data)
+rd.fit.logit <- glm(isBull~., data=rd.train, family=binomial())
+rd.prob <- predict(rd.fit.logit, rd.test, type="response")
+rd.logit.pred <- factor(rd.prob > .5, levels=c(FALSE, TRUE), labels=c("down", "up"))
+rd.logit.perf <- table(rd.test$isBull, rd.logit.pred,dnn=c("Actual", "Predicted"))
+
+## roc for logistic regression (random data)
+plot(performance(prediction(rd.prob, rd.test$isBull), "tpr","fpr"))
+performance(prediction(rd.prob, rd.test$isBull), "auc")
+
+#random forest (time data)
+
+set.seed(1234)
+fit.forest <- randomForest(isBull~., data=fd.train,na.action=na.roughfix, importance=TRUE)
+forest.pred <- predict(fit.forest, fd.test)
+forest.perf <- table(fd.test$isBull, forest.pred, dnn=c("Actual", "Predicted"))
+
+## roc for random forest (time data)
+forest.pred.roc <- predict(fit.forest, fd.test, type='prob')
+plot(performance(prediction(forest.pred.roc[,2], fd.test$isBull), "tpr","fpr"))
+performance(prediction(forest.pred.roc[,2], fd.test$isBull), "auc")
+
+#random forest (random data)
+rd.fit.forest <- randomForest(isBull~., data=rd.train,na.action=na.roughfix, importance=TRUE)
+rd.forest.pred <- predict(rd.fit.forest, rd.test)
+rd.forest.perf <- table(rd.test$isBull, rd.forest.pred, dnn=c("Actual", "Predicted"))
+
+## roc for random forest (random data)
+rd.forest.pred.roc <- predict(rd.fit.forest, rd.test, type='prob')
+plot(performance(prediction(rd.forest.pred.roc[,2], rd.test$isBull), "tpr","fpr"))
+performance(prediction(rd.forest.pred.roc[,2], rd.test$isBull), "auc")
+
+#surport vector machine (time data)
+
+fit.svm <- svm(isBull~., data=fd.train)
+svm.pred <- predict(fit.svm, na.omit(fd.test))
+svm.perf <- table(na.omit(fd.test)$isBull,svm.pred, dnn=c("Actual", "Predicted"))
+
+#roc for svm (time data)
+fit.svm.roc <- svm(isBull~., data=fd.train, probability=TRUE)
+svm.pred.roc <- predict(fit.svm.roc, na.omit(fd.test), decision.values=TRUE, probability=TRUE)
+plot(performance(prediction(attr(svm.pred.roc,"decision.values"), fd.test$isBull), "tpr","fpr"))
+performance(prediction(attr(svm.pred.roc,"decision.values"), fd.test$isBull), "auc")
+
+# test for random case
+rd.fit.svm <- svm(isBull~., data=rd.train)
+rd.svm.pred <- predict(rd.fit.svm, na.omit(rd.test))
+rd.svm.perf <- table(na.omit(rd.test)$isBull,rd.svm.pred, dnn=c("Actual", "Predicted"))
+
+#roc for svm (time data)
+rd.fit.svm.roc <- svm(isBull~., data=rd.train, probability=TRUE)
+rd.svm.pred.roc <- predict(rd.fit.svm.roc, na.omit(rd.test), decision.values=TRUE, probability=TRUE)
+plot(performance(prediction(attr(rd.svm.pred.roc,"decision.values"), rd.test$isBull), "tpr","fpr"))
+performance(prediction(attr(rd.svm.pred.roc,"decision.values"), rd.test$isBull), "auc")
+
+# test for sentimental data
+std.fit.svm <- svm(isBull~., data=std.train)
+std.svm.pred <- predict(std.fit.svm, na.omit(std.test))
+std.svm.perf <- table(na.omit(std.test)$isBull,std.svm.pred, dnn=c("Actual", "Predicted"))
+
+# test for forex data
+fx.fit.svm <- svm(isBull~., data=fx.train)
+fx.svm.pred <- predict(fx.fit.svm, na.omit(fx.test))
+fx.svm.perf <- table(na.omit(fx.test)$isBull,fx.svm.pred, dnn=c("Actual", "Predicted"))
+
+#best model
+model.accuracy <- function(table, n=2){
+if(!all(dim(table) == c(2,2)))
+stop("Must be a 2 x 2 table")
+tn = table[1,1]
+fp = table[1,2]
+fn = table[2,1]
+tp = table[2,2]
+sensitivity = tp/(tp+fn)
+specificity = tn/(tn+fp)
+ppp = tp/(tp+fp)
+npp = tn/(tn+fn)
+hitrate = (tp+tn)/(tp+tn+fp+fn)
+result <- paste("Sensitivity = ", round(sensitivity, n),
+"\nSpecificity = ", round(specificity, n),
+"\nPositive Predictive Value = ", round(ppp, n),
+"\nNegative Predictive Value = ", round(npp, n),
+"\nAccuracy = ", round(hitrate, n), "\n", sep="")
+
+#cat(result)
+return(round(hitrate, n))
+}
+
+# accuracy for djia time data using tf-idf
+model.accuracy(logit.perf)
+model.accuracy(forest.perf)
+model.accuracy(svm.perf)
+
+# auc for djia time data using tf-idf
+performance(prediction(prob, fd.test$isBull), "auc")
+performance(prediction(forest.pred.roc[,2], fd.test$isBull), "auc")
+performance(prediction(attr(svm.pred.roc,"decision.values"), fd.test$isBull), "auc")
+
+# accuracy for djia time data using tf-idf
+model.accuracy(rd.logit.perf)
+model.accuracy(rd.forest.perf)
+model.accuracy(rd.svm.perf)
+
+# auc for djia time data using tf-idf
+performance(prediction(rd.prob, rd.test$isBull), "auc")
+performance(prediction(rd.forest.pred.roc[,2], rd.test$isBull), "auc")
+performance(prediction(attr(rd.svm.pred.roc,"decision.values"), rd.test$isBull), "auc")
+
+evaluate.model <- function(data, type="time"){
+  if(type == "time"){
+    rd <- data[,-1]
+  }else if(type =="random") {
+    temp_data <- data[,-1]
+    rd <- temp_data[sample(nrow(temp_data)), ]           #sample rows 
+    print("random")
+  }
+  bound <- floor((nrow(data)/4)*3) 
+  rd.train <- rd[1:bound, ]              #get training set
+  rd.test <- rd[(bound+1):nrow(rd), ]    #get test set
+  
+  #logistic regression
+  fit.logit <- glm(isBull~., data=rd.train, family=binomial())
+  prob <- predict(fit.logit, rd.test, type="response")
+  logit.pred <- factor(prob > .5, levels=c(FALSE, TRUE), labels=c("down", "up"))
+  logit.perf <- table(rd.test$isBull, logit.pred,dnn=c("Actual", "Predicted"))
+  acc.logit <- model.accuracy(logit.perf)
+  
+  ## roc for logistic regression
+  auc.logit.perf <- performance(prediction(prob, rd.test$isBull), "auc")
+  auc.logit <- round(as.numeric(auc.logit.perf@y.values), 2)
+  
+  #random forest (random data)
+  rd.fit.forest <- randomForest(isBull~., data=rd.train,na.action=na.roughfix, importance=TRUE)
+  rd.forest.pred <- predict(rd.fit.forest, rd.test)
+  rd.forest.perf <- table(rd.test$isBull, rd.forest.pred, dnn=c("Actual", "Predicted"))
+  acc.randomforest <- model.accuracy(rd.forest.perf)
+  
+  ## roc for random forest (random data)
+  rd.forest.pred.roc <- predict(rd.fit.forest, rd.test, type='prob')
+  performance(prediction(rd.forest.pred.roc[,2], rd.test$isBull), "auc")
+  
+  auc.rf.perf <- performance(prediction(rd.forest.pred.roc[,2], rd.test$isBull), "auc")
+  auc.randomforest <- round(as.numeric(auc.rf.perf@y.values), 2)
+  
+  # test for random case
+  rd.fit.svm <- svm(isBull~., data=rd.train)
+  rd.svm.pred <- predict(rd.fit.svm, na.omit(rd.test))
+  rd.svm.perf <- table(na.omit(rd.test)$isBull,rd.svm.pred, dnn=c("Actual", "Predicted"))
+  acc.svm <- model.accuracy(rd.svm.perf)
+  
+  #roc for svm (time data)
+  rd.fit.svm.roc <- svm(isBull~., data=rd.train, probability=TRUE)
+  rd.svm.pred.roc <- predict(rd.fit.svm.roc, na.omit(rd.test), decision.values=TRUE, probability=TRUE)
+  auc.svm.perf <- performance(prediction(attr(rd.svm.pred.roc,"decision.values"), rd.test$isBull), "auc")
+  auc.svm <- round(as.numeric(auc.svm.perf@y.values), 2)
+  
+  x <- c("Accuracy","AUC")
+  lg <- c(acc.logit, auc.logit)
+  rf <- c(acc.randomforest, auc.randomforest)
+  sv <- c(acc.svm, auc.svm)
+  
+  result <- data.frame("Type"=x, "Logit"=lg, "RF"=rf, "SVM"=sv)
+  return(result)
+}
+
+evaluate.model(final_data)
+evaluate.model(final_data, type="random")
+evaluate.model(final_data.Bing)
+evaluate.model(final_data.Bing, type="random")
+evaluate.model(final_data.fx)
+evaluate.model(final_data.fx, type="random")
+
+```
+
+
+5. Conclusion
+I did several experiments to confirm the relationship between the world news and US stock market. The reason for doing this experiment is to confirm it based on the premise that economies of countries with large markets are often responsive to global issues. I did the experiment with two markets, US stock market and the foreign exchange market. Before doing this experiment, I estimate over 60% accuracy through previous studies which analyze India stock market and tweets related to India. The results of our experiment are 53%, 51%, respectively. This means that the world news and US stock market or the foreign exchange market have less relationship than I thought. There are many reasons for this. Once the world news deals with issues around the world, its scope is too broad. Also, it is difficult to estimate the relationship because the world news is mostly composed of negative words. Lastly, I used the data for eight years, but there was still insufficient data. Nevertheless, the result of about 50% means that there is an irreducible relationship between them.
